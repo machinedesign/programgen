@@ -10,6 +10,8 @@ from torch.autograd import Variable
 import torch.nn as nn
 import torch.nn.utils.rnn as rnn_utils
 
+import logging
+
 from machinedesign.transformers import DocumentVectorizer
 
 from . import formula
@@ -239,6 +241,7 @@ def train(*, nb_epochs=10000, nb_programs=10, nb_examples=64,
           hidden_size=64, lr=1e-3, cuda=False, test_ratio=0.1, 
           mod='minipython',
           outf='.',
+          log_level='DEBUG',
           nb_trials=10):
     """
     Parameters
@@ -252,6 +255,24 @@ def train(*, nb_epochs=10000, nb_programs=10, nb_examples=64,
     For the others, check the doc of RNN
     """
     np.random.seed(43)
+    
+    stream = logging.StreamHandler()
+    stream.setLevel(log_level)
+
+    hndl = logging.FileHandler('{}/train.log'.format(outf), mode='w')
+    hndl.setLevel(logging.DEBUG)
+    hndl_test = logging.FileHandler('{}/test.log'.format(outf), mode='w')
+    hndl.setLevel(logging.DEBUG)
+
+    log = logging.getLogger('train')
+    log.setLevel(logging.DEBUG)
+    log.addHandler(stream)
+    log.addHandler(hndl)
+    
+    log_test = logging.getLogger('test')
+    log_test.setLevel(logging.DEBUG)
+    log_test.addHandler(stream)
+    log_test.addHandler(hndl_test)
     
     mod = {'minipython': minipython, 'formula': formula}[mod]
     gen_program = mod.gen_code
@@ -316,7 +337,7 @@ def train(*, nb_epochs=10000, nb_programs=10, nb_examples=64,
             rnn.zero_grad()
             code = datapoint.code
             vals = datapoint.vals
-            mem = datapoint.mems
+            mems = datapoint.mems
             inps = datapoint.inps
             outs = datapoint.outs
 
@@ -328,13 +349,14 @@ def train(*, nb_epochs=10000, nb_programs=10, nb_examples=64,
             # pad the memory of each example with zeros to have mem_size size
             # and make the first state of the memory full of zeros
             # mem has shape (nb_examples, max_trace_length, mem_size)
-            mem_length = [len(m) for m in mem]
-            mem = [padded([[]] + m, max_length=mem_size) for m in mem]
+            mem_length = [len(mem) for mem in mems]
+            mems = [padded([[]] + mem, max_length=mem_size) for mem in mems]
 
             # TODO : it will not work if the examples don't have the same number
             # of steps for the memory states.
             # To make it work, I should do padding here.
-            mem = torch.FloatTensor(mem)
+            mem = torch.FloatTensor(mems)
+            mem = torch.log(1 + mem)
             # X contains the inputs and outputs contatenated
             vals = [padded([v], max_length=nb_features)[0] for v in vals]
             X = Variable(torch.FloatTensor(vals))
@@ -393,18 +415,18 @@ def train(*, nb_epochs=10000, nb_programs=10, nb_examples=64,
                 for _ in range(nb_trials):
                     t = rnn.generate(X, mem_len=max(mem_length), text_len=max_code_size, cuda=cuda, greedy=False)
                     t, = doc.inverse_transform([t])
-                    score = unit_test(t, inputs=inps, outputs=outs, exec_code=exec_code)
+                    score = unit_test(t, inputs=inps, outputs=outs, exec_code=exec_code, print=log.debug)
                     if score > max_score or best is None:
                         max_score = score
                         best = t
                 t = best
-                print('Max score : {:.3f}'.format(max_score))
+                log.debug('Max score : {:.3f}'.format(max_score))
                 avg_score = avg_score * 0.9 + max_score * 0.1
-                print('****** Real')
-                print(to_str(code))
-                print('****** Generated')
-                print(to_str(t))
-                print('****** Unit test')
+                log.info('****** Real')
+                log.info(to_str(code))
+                log.info('****** Generated')
+                log.info(to_str(t))
+                log.info('****** Unit test')
                 total = 0
                 correct = 0
                 for _ in range(10):
@@ -416,9 +438,8 @@ def train(*, nb_epochs=10000, nb_programs=10, nb_examples=64,
                         pred_out = None
                     correct += (pred_out == out)
                     total += 1
-                    print('Input : {}, Output : {}, Predicted : {}'.format(inp, out, pred_out))
-                print('Passed : {}/{}'.format(correct, total))
-                print('\n')
+                    log.debug('Input : {}, Output : {}, Predicted : {}'.format(inp, out, pred_out))
+                log.debug('Passed : {}/{}'.format(correct, total))
                 torch.save(rnn, '{}/model.pth'.format(outf))
                 pd.DataFrame(stats).to_csv('{}/stats.csv'.format(outf))
             
@@ -437,7 +458,7 @@ def train(*, nb_epochs=10000, nb_programs=10, nb_examples=64,
             stats['avg_acc'].append(avg_acc)
             stats['avg_score'].append(avg_score)
             if nb_updates % 10 == 0:
-                print('avg_loss : {:.3f} avg_acc : {:.3f} avg_score : {:.3f} avg_r2_mem {:.3f} loss : {:.3f} loss_mem : {:.3f} r2_mem : {:.3f} loss_code : {:.3f} acc : {:.3f} time : {:.3f}'.format(
+                log.info('avg_loss : {:.3f} avg_acc : {:.3f} avg_score : {:.3f} avg_r2_mem {:.3f} loss : {:.3f} loss_mem : {:.3f} r2_mem : {:.3f} loss_code : {:.3f} acc : {:.3f} time : {:.3f}'.format(
                     avg_loss,
                     avg_acc,
                     avg_score,
@@ -468,7 +489,7 @@ def train(*, nb_epochs=10000, nb_programs=10, nb_examples=64,
                 for _ in range(nb_trials):
                     t = rnn.generate(X, mem_len=max(mem_length), text_len=max_code_size, cuda=cuda, greedy=False)
                     t, = doc.inverse_transform([t])
-                    score = unit_test(t, inputs=inps, outputs=outs, exec_code=exec_code)
+                    score = unit_test(t, inputs=inps, outputs=outs, exec_code=exec_code, print=log_test.debug)
                     if score > max_score or best is None:
                         max_score = score
                         best = t
@@ -483,7 +504,7 @@ def train(*, nb_epochs=10000, nb_programs=10, nb_examples=64,
 
             pd.DataFrame({'test_score': test_scores, 'perfect_test_score': perfect_test_scores}).to_csv('{}/stats_test.csv'.format(outf))
             dt = time.time() - t0
-            print('test score : {:.3f} perfect test score : {:.3f} time : {:.3f}'.format(test_score, perfect_test_score, dt))
+            log_test.info('test score : {:.3f} perfect test score : {:.3f} time : {:.3f}'.format(test_score, perfect_test_score, dt))
 
  
 def acc(pred, true):
@@ -492,14 +513,17 @@ def acc(pred, true):
     return acc
 
 
-def unit_test(code, inputs, outputs, exec_code=minipython.exec_code):
+def unit_test(code, inputs, outputs, exec_code=minipython.exec_code, print=print):
     correct = 0
+    print('Unit test of : {}'.format(code))
     for inp, out in zip(inputs, outputs):
         try:
             pred_out = exec_code(code, input=inp)
         except Exception as ex:
             pred_out = None
+        print('Predicted : {} Correct : {}'.format(pred_out, out))
         correct += (np.all(np.isclose(pred_out, out))) if pred_out is not None else 0
+    print('Passed : {}/{}'.format(correct, len(inputs)))
     return correct / float(len(inputs))
 
 if __name__ == '__main__':
