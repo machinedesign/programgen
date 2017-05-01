@@ -4,7 +4,8 @@ from collections import namedtuple
 
 import numpy as np
 
-Program = namedtuple('Program', ['code', 'vals', 'mems', 'inps', 'outs'])
+from .common import Program
+from .utils import to_str
 
 class dotdict(OrderedDict):
 
@@ -109,11 +110,6 @@ def _exec_code(s, **kwargs):
     vars.update(kwargs)
     exec(s)
     return vars
-
-
-def to_str(sent, sep=''):
-    sent = [s for s in sent if s not in (0, 1, 2, 3)]
-    return sep.join(sent)
 
 
 def gen_examples(code, nb_examples=10):

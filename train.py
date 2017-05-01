@@ -12,11 +12,10 @@ import torch.nn.utils.rnn as rnn_utils
 
 from machinedesign.transformers import DocumentVectorizer
 
-import formula
-import minipython
-
-from utils import padded
-
+from . import formula
+from . import minipython
+from .utils import padded
+from .utils import to_str
 
 class RNN(nn.Module):
 
@@ -235,9 +234,12 @@ class RNN(nn.Module):
     def trepr(self, ot, mt):
         return torch.cat((mt, mt), 2)
 
-def train(*, nb_epochs=1000, nb_programs=10, nb_examples=64, 
+def train(*, nb_epochs=10000, nb_programs=10, nb_examples=64, 
           nb_features=None, emb_size=100, mem_size=None, 
-          hidden_size=64, lr=1e-3, cuda=False, test_ratio=0., nb_trials=10):
+          hidden_size=64, lr=1e-3, cuda=False, test_ratio=0.1, 
+          mod='minipython',
+          outf='.',
+          nb_trials=10):
     """
     Parameters
     ==========
@@ -250,11 +252,12 @@ def train(*, nb_epochs=1000, nb_programs=10, nb_examples=64,
     For the others, check the doc of RNN
     """
     np.random.seed(43)
-
-    gen_program = minipython.gen_code
-    gen_examples = minipython.gen_examples
-    exec_code = minipython.exec_code
-    gen_input = minipython.gen_input
+    
+    mod = {'minipython': minipython, 'formula': formula}[mod]
+    gen_program = mod.gen_code
+    gen_examples = mod.gen_examples
+    exec_code = mod.exec_code
+    gen_input = mod.gen_input
 
     programs = [gen_program() for _ in range(nb_programs)]
     max_code_size = max(map(len, programs))
@@ -395,11 +398,12 @@ def train(*, nb_epochs=1000, nb_programs=10, nb_examples=64,
                         max_score = score
                         best = t
                 t = best
+                print('Max score : {:.3f}'.format(max_score))
                 avg_score = avg_score * 0.9 + max_score * 0.1
                 print('****** Real')
-                print(minipython.to_str(code))
+                print(to_str(code))
                 print('****** Generated')
-                print(minipython.to_str(t))
+                print(to_str(t))
                 print('****** Unit test')
                 total = 0
                 correct = 0
@@ -415,8 +419,8 @@ def train(*, nb_epochs=1000, nb_programs=10, nb_examples=64,
                     print('Input : {}, Output : {}, Predicted : {}'.format(inp, out, pred_out))
                 print('Passed : {}/{}'.format(correct, total))
                 print('\n')
-                torch.save(rnn, 'model.pth')
-                pd.DataFrame(stats).to_csv('stats.csv')
+                torch.save(rnn, '{}/model.pth'.format(outf))
+                pd.DataFrame(stats).to_csv('{}/stats.csv'.format(outf))
             
             code_acc = acc(ot, T_out)
             stats['loss'].append(loss.data[0])
@@ -444,12 +448,11 @@ def train(*, nb_epochs=1000, nb_programs=10, nb_examples=64,
                     stats['loss_code'][-1], 
                     stats['acc'][-1], 
                     dt))
-                #print(minipython.to_str(code))
             nb_updates += 1
         # Testing after the end of each epoch
         if epoch % 10 == 0:
             t0 = time.time()
-            test_scores = []
+            cur_test_scores = []
             for datapoint in dataset_test:
                 t0 = time.time()
                 code = datapoint.code
@@ -470,12 +473,15 @@ def train(*, nb_epochs=1000, nb_programs=10, nb_examples=64,
                         max_score = score
                         best = t
                 t = best
-                test_scores.append(max_score)
-            test_score = np.mean(test_scores)
-            perfect_test_score = (np.array(test_scores) == 1).mean()
+                cur_test_scores.append(max_score)
+
+            test_score = np.mean(cur_test_scores)
             test_scores.append(test_score)
+
+            perfect_test_score = (np.array(cur_test_scores) == 1).mean()
             perfect_test_scores.append(perfect_test_score)
-            pd.DataFrame({'test_score': test_scores, 'perfect_test_score': perfect_test_scores}).to_csv('stats_test.csv')
+
+            pd.DataFrame({'test_score': test_scores, 'perfect_test_score': perfect_test_scores}).to_csv('{}/stats_test.csv'.format(outf))
             dt = time.time() - t0
             print('test score : {:.3f} perfect test score : {:.3f} time : {:.3f}'.format(test_score, perfect_test_score, dt))
 
@@ -493,9 +499,8 @@ def unit_test(code, inputs, outputs, exec_code=minipython.exec_code):
             pred_out = exec_code(code, input=inp)
         except Exception as ex:
             pred_out = None
-        correct += (pred_out == out)
+        correct += (np.all(np.isclose(pred_out, out))) if pred_out is not None else 0
     return correct / float(len(inputs))
-
 
 if __name__ == '__main__':
     run(train)
