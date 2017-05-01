@@ -19,9 +19,80 @@ from . import minipython
 from .utils import padded
 from .utils import to_str
 
+class Simple(nn.Module):
+
+    def __init__(self, nb_examples=10, nb_features=2, emb_size=50, mem_size=50, mem_len=10, hidden_size=32, vocab_size=10):
+        super().__init__()
+        self.mem_len = mem_len
+        self.mem_size = mem_size
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.repr_features = nn.Sequential(
+            nn.Linear(nb_features, hidden_size),
+            nn.ReLU(True),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(True)
+        )
+        self.pred_mem_val = nn.Linear(hidden_size, mem_len * mem_size)
+        self.mem_repr = nn.Linear(mem_len * mem_size, hidden_size)
+        self.text_rnn = nn.LSTM(emb_size + hidden_size, hidden_size, batch_first=True)
+        self.emb = nn.Embedding(vocab_size, emb_size)
+        self.text_out =  nn.Linear(hidden_size, vocab_size)
+ 
+    
+    def forward(self, X, M, T):
+        X = self.repr_features(X)
+        T = self.emb(T)
+        om_val = self.pred_mem_val(X)
+        m = self.mem_repr(om_val)
+        m = m.mean(0).view(1, 1, -1)
+        m = m.repeat(1, T.size(1), 1)
+        t = torch.cat((T, m), 2)
+        ot, (ht, ct) = self.text_rnn(t)
+        ot = ot.view(-1, ot.size(2))
+        ot = self.text_out(ot)
+        om_val = om_val.view(om_val.size(0), self.mem_len, self.mem_size).view(-1, self.mem_size)
+        return om_val, ot
+    
+    def generate(self, X, mem_len=13, text_len=20, cuda=False, greedy=False):
+        X = self.repr_features(X)
+        m = self.pred_mem_val(X)
+        m = self.mem_repr(m)
+        m = m.mean(0).view(1, 1, -1)
+
+        T = torch.ones(1, 1).long()
+        T = Variable(T)
+        if cuda:
+            T = T.cuda()
+        ht, ct = torch.zeros(1, 1, self.hidden_size), torch.zeros(1, 1, self.hidden_size)
+        ht = Variable(ht)
+        ct = Variable(ct)
+        if cuda:
+            ht = ht.cuda()
+            ct = ct.cuda()
+        t = []
+        for _ in range(text_len):
+            T_emb = self.emb(T.detach())
+            x = torch.cat((T_emb, m), 2)
+            ot, (ht, ct) = self.text_rnn(x, (ht, ct))
+            ot = ot.view(-1, self.hidden_size)
+            ot = nn.Softmax()(self.text_out(ot))
+            ot = ot.view(-1)
+            if greedy:
+                ot = ot.max(0)[1]
+            else:
+                ot = torch.multinomial(ot)
+            T.data[:, :] = ot.data[0]
+            t.append(ot.data[0])
+            if ot.data[0] == 2:
+                break
+        return t
+   
+
+
 class RNN(nn.Module):
 
-    def __init__(self, nb_examples=10, nb_features=2, emb_size=50, mem_size=30, hidden_size=32, vocab_size=10):
+    def __init__(self, nb_examples=10, nb_features=2, emb_size=50, mem_size=30, mem_len=10, hidden_size=32, vocab_size=10):
         """
         Parameters
         ==========
@@ -59,8 +130,6 @@ class RNN(nn.Module):
         self.text_rnn = nn.LSTM(emb_size, hidden_size, batch_first=True)
         # predicts memory states using LSTM hidden state
         self.mem_out = nn.Sequential(nn.Linear(hidden_size, mem_size))
-        # predicts memory controller state based on LSTM hidden state
-        self.mem_ctrl_out = nn.Linear(hidden_size, 2)
         # predicts probability of next character of program code given LSTM hidden state
         self.text_out =  nn.Linear(hidden_size * 2, vocab_size)
         # embedding of program code
@@ -90,14 +159,13 @@ class RNN(nn.Module):
         # Get the prediction of memory states and controller state
         om = om.contiguous()
         om = om.view(-1, self.hidden_size)
-        # -- Predict the next controller state
-        om_ctrl = self.mem_ctrl_out(om)
         # -- Predict the next memory state
         om_val = self.mem_out(om)
-        return om_val, om_ctrl, ot
+        return om_val, ot
     
     def attention(self, om, ot):
         return self._attention_fast(om, ot)
+        #return self._attention_baseline(om, ot)
 
     def _attention_baseline(self, om, ot):
         return om[:, :].mean(0).mean(1).repeat(1, ot.size(1), 1)
@@ -185,14 +253,7 @@ class RNN(nn.Module):
             oms.append(om)
             om = om.contiguous()
             om = om.view(-1, self.hidden_size)
-            om_ctrl = self.mem_ctrl_out(om)
             om_val = self.mem_out(om)
-            if greedy:
-                om_ctrl = om_ctrl.max(1)[1]
-            else:
-                om_ctrl = torch.multinomial(nn.Softmax()(om_ctrl))
-            #if om_ctrl.sum() == om_ctrl.size(0):
-            #    break
             M.data.copy_(om_val.data.view(om_val.size(0), 1, om_val.size(1)))
         om = torch.cat(oms, 1) 
         # At this point, we have a list of memory states for each example
@@ -236,9 +297,10 @@ class RNN(nn.Module):
     def trepr(self, ot, mt):
         return torch.cat((mt, mt), 2)
 
+
 def train(*, nb_epochs=10000, nb_programs=10, nb_examples=64, 
-          nb_features=None, emb_size=100, mem_size=None, 
-          hidden_size=64, lr=1e-3, cuda=False, test_ratio=0.1, 
+          nb_features=None, emb_size=100, mem_size=None, mem_len=None,
+          hidden_size=128, lr=1e-3, cuda=False, test_ratio=0.1, 
           mod='minipython',
           outf='.',
           log_level='DEBUG',
@@ -262,7 +324,7 @@ def train(*, nb_epochs=10000, nb_programs=10, nb_examples=64,
     hndl = logging.FileHandler('{}/train.log'.format(outf), mode='w')
     hndl.setLevel(logging.DEBUG)
     hndl_test = logging.FileHandler('{}/test.log'.format(outf), mode='w')
-    hndl.setLevel(logging.DEBUG)
+    hndl_test.setLevel(logging.DEBUG)
 
     log = logging.getLogger('train')
     log.setLevel(logging.DEBUG)
@@ -299,15 +361,20 @@ def train(*, nb_epochs=10000, nb_programs=10, nb_examples=64,
     if mem_size is None:
         # if not specified, take the maximum mem length across all traces of programs on all inputs
         mem_size = max(len(n) for e in dataset for m in e.mems for n in m)
+
     if nb_features is None:
         nb_features = max(len(v) for e in dataset for v in e.vals)
+
+    if mem_len is None:
+        mem_len = max(len(m) for e in dataset for m in e.mems)
     
     vocab_size = len(doc.words_)
-    rnn = RNN(
+    rnn = Simple(
         nb_examples=nb_examples, 
         nb_features=nb_features, 
         emb_size=emb_size,
         mem_size=mem_size,
+        mem_len=mem_len,
         hidden_size=hidden_size,
         vocab_size=vocab_size,
     )
@@ -349,27 +416,17 @@ def train(*, nb_epochs=10000, nb_programs=10, nb_examples=64,
             # pad the memory of each example with zeros to have mem_size size
             # and make the first state of the memory full of zeros
             # mem has shape (nb_examples, max_trace_length, mem_size)
-            mem_length = [len(mem) for mem in mems]
             mems = [padded([[]] + mem, max_length=mem_size) for mem in mems]
 
             # TODO : it will not work if the examples don't have the same number
             # of steps for the memory states.
             # To make it work, I should do padding here.
             mem = torch.FloatTensor(mems)
-            mem = torch.log(1 + mem)
+            #mem = torch.log(1 + mem)
             # X contains the inputs and outputs contatenated
             vals = [padded([v], max_length=nb_features)[0] for v in vals]
             X = Variable(torch.FloatTensor(vals))
             
-            # the controller encodes when we finish the program
-            # it is zero in all the timesteps execpt in the last timestep where it is one
-            # it is used in generation to know when to stop predicting the next memory
-            # state
-            ctrl_out = torch.zeros(mem.size(0), mem.size(1) - 1).long()
-            for i in range(mem.size(0)):
-                ctrl_out[i, mem_length[i] - 1:] = 1
-
-            M_ctrl_out = Variable(ctrl_out.view(-1))
             # we give current memory state that we give to LSTM
             M_inp = Variable(mem[:, 0:-1])
             # we ask the LSTM to predict the next memory state
@@ -385,20 +442,16 @@ def train(*, nb_epochs=10000, nb_programs=10, nb_examples=64,
                 X = X.cuda()
                 M_inp = M_inp.cuda()
                 M_out = M_out.cuda()
-                M_ctrl_out = M_ctrl_out.cuda()
                 T_inp = T_inp.cuda()
                 T_out = T_out.cuda()
 
             # om_val is the predicted memory states at each timetep
             # it has shape : (nb_examples * max_trace_length, mem_size)
-            # om_ctrl is the predicted controller termination probability at each timestep
-            # it has shape (nb_examples * max_trace_length, mem_size)
-            om_val, om_ctrl, ot = rnn(X, M_inp, T_inp)
+            om_val, ot = rnn(X, M_inp, T_inp)
             
             loss_mem_val = ((om_val - M_out) ** 2).mean() # mean sqr error for predicting memory states
-            loss_mem_ctrl = crit(om_ctrl, M_ctrl_out) # predict the correct proba of termination
             loss_code = crit(ot, T_out) # predict the correct next character for program code
-            loss =  loss_mem_val + loss_mem_ctrl + loss_code
+            loss =  loss_mem_val + loss_code
             loss.backward()
             nn.utils.clip_grad_norm(rnn.parameters(), 2)
             optim.step()
@@ -413,7 +466,7 @@ def train(*, nb_epochs=10000, nb_programs=10, nb_examples=64,
                 max_score = 0.
                 best = None
                 for _ in range(nb_trials):
-                    t = rnn.generate(X, mem_len=max(mem_length), text_len=max_code_size, cuda=cuda, greedy=False)
+                    t = rnn.generate(X, mem_len=mem_len, text_len=max_code_size, cuda=cuda, greedy=False)
                     t, = doc.inverse_transform([t])
                     score = unit_test(t, inputs=inps, outputs=outs, exec_code=exec_code, print=log.debug)
                     if score > max_score or best is None:
@@ -487,8 +540,9 @@ def train(*, nb_epochs=10000, nb_programs=10, nb_examples=64,
                 max_score = 0.
                 best = None
                 for _ in range(nb_trials):
-                    t = rnn.generate(X, mem_len=max(mem_length), text_len=max_code_size, cuda=cuda, greedy=False)
+                    t = rnn.generate(X, mem_len=mem_len, text_len=max_code_size, cuda=cuda, greedy=False)
                     t, = doc.inverse_transform([t])
+                    log_test.debug('Groundtruth : {}'.format(to_str(code)))
                     score = unit_test(t, inputs=inps, outputs=outs, exec_code=exec_code, print=log_test.debug)
                     if score > max_score or best is None:
                         max_score = score
@@ -515,14 +569,14 @@ def acc(pred, true):
 
 def unit_test(code, inputs, outputs, exec_code=minipython.exec_code, print=print):
     correct = 0
-    print('Unit test of : {}'.format(code))
+    print('Unit test of : {}'.format(to_str(code)))
     for inp, out in zip(inputs, outputs):
         try:
             pred_out = exec_code(code, input=inp)
         except Exception as ex:
             pred_out = None
         print('Predicted : {} Correct : {}'.format(pred_out, out))
-        correct += (np.all(np.isclose(pred_out, out))) if pred_out is not None else 0
+        correct += (np.all(np.isclose(pred_out, out))) if type(pred_out) == type(out) and len(pred_out) == len(out) else 0
     print('Passed : {}/{}'.format(correct, len(inputs)))
     return correct / float(len(inputs))
 

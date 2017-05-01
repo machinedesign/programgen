@@ -76,7 +76,7 @@ def _gen_examples(code, nb_examples=10, symbols=None, gen_value=None):
         inps.append(inp)
         mem = _exec_code(code, inp, symbols=symbols, gen_value=gen_value)
         out = mem[-1][0]
-        outs.append(out)
+        outs.append([out])
         v.append(out)
         mems.append(mem)
         vals.append(v)
