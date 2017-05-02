@@ -16,6 +16,8 @@ from machinedesign.transformers import DocumentVectorizer
 
 from . import formula
 from . import minipython
+from .common import program_checksum
+from .common import gen_programs
 from .utils import padded
 from .utils import to_str
 
@@ -298,7 +300,7 @@ class RNN(nn.Module):
         return torch.cat((mt, mt), 2)
 
 
-def train(*, nb_epochs=10000, nb_programs=10, nb_examples=64, 
+def train(*, nb_epochs=100, nb_programs=10, nb_examples=64, 
           nb_features=None, emb_size=100, mem_size=None, mem_len=None,
           hidden_size=128, lr=1e-3, cuda=False, test_ratio=0.1, 
           mod='minipython',
@@ -342,7 +344,8 @@ def train(*, nb_epochs=10000, nb_programs=10, nb_examples=64,
     exec_code = mod.exec_code
     gen_input = mod.gen_input
 
-    programs = [gen_program() for _ in range(nb_programs)]
+    # generate programs and make sure there are no duplicates
+    programs = gen_programs(mod.gen_input, mod.gen_code, mod.exec_code, nb_programs=nb_programs)
     max_code_size = max(map(len, programs))
     
     length = max(map(len, programs)) + 2 # we add 2 because of begin and end characters
@@ -354,6 +357,7 @@ def train(*, nb_epochs=10000, nb_programs=10, nb_examples=64,
     # for each program we have nb_examples set of inputs and their corresponding outputs
     # where the outputs are obtained by executing the program on the inputs
     dataset = []
+    
     for program in programs:
         data = gen_examples(program, nb_examples=nb_examples)
         dataset.append(data)
@@ -389,6 +393,7 @@ def train(*, nb_epochs=10000, nb_programs=10, nb_examples=64,
     avg_loss = 0.
     avg_acc = 0.
     avg_score = 0.
+    avg_perfect_score = 0.
     avg_r2_mem = 0.
     gamma = 0.99
     
@@ -475,6 +480,7 @@ def train(*, nb_epochs=10000, nb_programs=10, nb_examples=64,
                 t = best
                 log.debug('Max score : {:.3f}'.format(max_score))
                 avg_score = avg_score * 0.9 + max_score * 0.1
+                avg_perfect_score = avg_perfect_score * 0.9 + (max_score==1.) * 0.1
                 log.info('****** Real')
                 log.info(to_str(code))
                 log.info('****** Generated')
@@ -510,18 +516,13 @@ def train(*, nb_epochs=10000, nb_programs=10, nb_examples=64,
             stats['avg_loss'].append(avg_loss)
             stats['avg_acc'].append(avg_acc)
             stats['avg_score'].append(avg_score)
+            stats['avg_perfect_score'].append(avg_perfect_score)
+
             if nb_updates % 10 == 0:
-                log.info('avg_loss : {:.3f} avg_acc : {:.3f} avg_score : {:.3f} avg_r2_mem {:.3f} loss : {:.3f} loss_mem : {:.3f} r2_mem : {:.3f} loss_code : {:.3f} acc : {:.3f} time : {:.3f}'.format(
-                    avg_loss,
-                    avg_acc,
-                    avg_score,
-                    avg_r2_mem,
-                    stats['loss'][-1], 
-                    stats['loss_mem'][-1], 
-                    stats['r2_mem'][-1],
-                    stats['loss_code'][-1], 
-                    stats['acc'][-1], 
-                    dt))
+                s = ['{} : {:.3f}'.format(k, v[-1]) for k, v in stats.items()]
+                s = ' '.join(s)
+                s = 'epoch {:03d} '.format(epoch) + s
+                log.info(s)
             nb_updates += 1
         # Testing after the end of each epoch
         if epoch % 10 == 0:
@@ -576,7 +577,11 @@ def unit_test(code, inputs, outputs, exec_code=minipython.exec_code, print=print
         except Exception as ex:
             pred_out = None
         print('Predicted : {} Correct : {}'.format(pred_out, out))
-        correct += (np.all(np.isclose(pred_out, out))) if type(pred_out) == type(out) and len(pred_out) == len(out) else 0
+        try:
+            is_correct = np.all(np.isclose(pred_out, out))
+        except Exception:
+            is_correct = 0
+        correct += is_correct
     print('Passed : {}/{}'.format(correct, len(inputs)))
     return correct / float(len(inputs))
 
