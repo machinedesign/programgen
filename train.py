@@ -231,7 +231,7 @@ class RNN(nn.Module):
         # return the weighted sum of memory representations at each timestep i
         mt = torch.cat(mts, 0)
         mt = mt.view(1, mt.size(0), mt.size(1))
-        # shape of mt : (1, max_trace_length, mem_size)
+        # shape of mt : (1, mem_len, mem_size)
         return mt
 
     def generate(self, X, mem_len=13, text_len=20, cuda=False, greedy=False):
@@ -261,7 +261,6 @@ class RNN(nn.Module):
         # At this point, we have a list of memory states for each example
         # Now, predict the code character given the predicted list of memory states
         # and current code character
-
         T = torch.ones(1, 1).long()
         T = Variable(T)
         if cuda:
@@ -363,16 +362,20 @@ def train(*, nb_epochs=100, nb_programs=10, nb_examples=64,
         dataset.append(data)
     
     if mem_size is None:
-        # if not specified, take the maximum mem length across all traces of programs on all inputs
+        # maximum mem size per memory state timestep across all programs and examples of those programs
         mem_size = max(len(n) for e in dataset for m in e.mems for n in m)
 
     if nb_features is None:
+        # maximum size of concatenated inputs and outputs
         nb_features = max(len(v) for e in dataset for v in e.vals)
 
     if mem_len is None:
+        # maximum number of memory states timesteps across all programs and examples of those programs
         mem_len = max(len(m) for e in dataset for m in e.mems)
     
+    # vocabulary size for the code
     vocab_size = len(doc.words_)
+
     rnn = Simple(
         nb_examples=nb_examples, 
         nb_features=nb_features, 
@@ -414,13 +417,13 @@ def train(*, nb_epochs=100, nb_programs=10, nb_examples=64,
             outs = datapoint.outs
 
             # transform the code into a list of ints
-            expr, = doc.transform([code])
-            expr = torch.LongTensor(expr)
-            expr = expr.view(1, expr.size(0))
+            code_int, = doc.transform([code])
+            code_int = torch.LongTensor(code_int)
+            code_int = code_int.view(1, code_int.size(0))
 
             # pad the memory of each example with zeros to have mem_size size
             # and make the first state of the memory full of zeros
-            # mem has shape (nb_examples, max_trace_length, mem_size)
+            # mem has shape (nb_examples, mem_len, mem_size)
             mems = [padded([[]] + mem, max_length=mem_size) for mem in mems]
 
             # TODO : it will not work if the examples don't have the same number
@@ -439,9 +442,9 @@ def train(*, nb_epochs=100, nb_programs=10, nb_examples=64,
 
             # we condition the generated program code on the memory states
             # and on the current character of the program code
-            T_inp = Variable(expr[:, 0:-1])
+            T_inp = Variable(code_int[:, 0:-1])
             # we predict the next character of the program code
-            T_out = Variable(expr[:, 1:]).view(-1)
+            T_out = Variable(code_int[:, 1:]).view(-1)
             
             if cuda:
                 X = X.cuda()
@@ -451,7 +454,7 @@ def train(*, nb_epochs=100, nb_programs=10, nb_examples=64,
                 T_out = T_out.cuda()
 
             # om_val is the predicted memory states at each timetep
-            # it has shape : (nb_examples * max_trace_length, mem_size)
+            # it has shape : (nb_examples * mem_len, mem_size)
             om_val, ot = rnn(X, M_inp, T_inp)
             
             loss_mem_val = ((om_val - M_out) ** 2).mean() # mean sqr error for predicting memory states
@@ -461,12 +464,34 @@ def train(*, nb_epochs=100, nb_programs=10, nb_examples=64,
             nn.utils.clip_grad_norm(rnn.parameters(), 2)
             optim.step()
             
-            res = ((om_val.view(-1) - M_out.view(-1))**2).mean()
+            resid = ((om_val.view(-1) - M_out.view(-1))**2).mean()
             tot = M_out.view(-1).var()
-            r2_mem_val = 1. - res / tot
+            r2_mem_val = 1. - resid / tot
 
-            dt = time.time() - t0
+            dt = time.time() - t0            
+            code_acc = acc(ot, T_out)
+            stats['loss'].append(loss.data[0])
+            stats['loss_mem'].append(loss_mem_val.data[0])
+            stats['r2_mem'].append(r2_mem_val.data[0])
+            stats['loss_code'].append(loss_code.data[0])
+            stats['acc'].append(code_acc.data[0])
+            stats['dt'].append(dt)
             
+            avg_loss = avg_loss * gamma + stats['loss'][-1] * (1 - gamma)
+            avg_acc = avg_acc * gamma + stats['acc'][-1] * (1 - gamma)
+            avg_r2_mem = avg_r2_mem * gamma + stats['r2_mem'][-1] * (1 - gamma)
+            stats['avg_loss'].append(avg_loss)
+            stats['avg_acc'].append(avg_acc)
+            stats['avg_score'].append(avg_score)
+            stats['avg_perfect_score'].append(avg_perfect_score)
+
+            if nb_updates % 10 == 0:
+                s = ['{} : {:.3f}'.format(k, v[-1]) for k, v in stats.items()]
+                s = sorted(s)
+                s = ' '.join(s)
+                s = 'epoch {:03d} '.format(epoch) + s
+                log.info(s)
+
             if nb_updates % 100 == 0:
                 max_score = 0.
                 best = None
@@ -501,30 +526,9 @@ def train(*, nb_epochs=100, nb_programs=10, nb_examples=64,
                 log.debug('Passed : {}/{}'.format(correct, total))
                 torch.save(rnn, '{}/model.pth'.format(outf))
                 pd.DataFrame(stats).to_csv('{}/stats.csv'.format(outf))
-            
-            code_acc = acc(ot, T_out)
-            stats['loss'].append(loss.data[0])
-            stats['loss_mem'].append(loss_mem_val.data[0])
-            stats['r2_mem'].append(r2_mem_val.data[0])
-            stats['loss_code'].append(loss_code.data[0])
-            stats['acc'].append(code_acc.data[0])
-            stats['dt'].append(dt)
-            
-            avg_loss = avg_loss * gamma + stats['loss'][-1] * (1 - gamma)
-            avg_acc = avg_acc * gamma + stats['acc'][-1] * (1 - gamma)
-            avg_r2_mem = avg_r2_mem * gamma + stats['r2_mem'][-1] * (1 - gamma)
-            stats['avg_loss'].append(avg_loss)
-            stats['avg_acc'].append(avg_acc)
-            stats['avg_score'].append(avg_score)
-            stats['avg_perfect_score'].append(avg_perfect_score)
-
-            if nb_updates % 10 == 0:
-                s = ['{} : {:.3f}'.format(k, v[-1]) for k, v in stats.items()]
-                s = ' '.join(s)
-                s = 'epoch {:03d} '.format(epoch) + s
-                log.info(s)
             nb_updates += 1
-        # Testing after the end of each epoch
+
+        # Testing
         if epoch % 10 == 0:
             t0 = time.time()
             cur_test_scores = []
@@ -578,12 +582,16 @@ def unit_test(code, inputs, outputs, exec_code=minipython.exec_code, print=print
             pred_out = None
         print('Predicted : {} Correct : {}'.format(pred_out, out))
         try:
-            is_correct = np.all(np.isclose(pred_out, out))
+            if len(pred_out) == len(out):
+                is_correct = np.all(np.isclose(pred_out, out))
+            else:
+                is_correct = 0
         except Exception:
             is_correct = 0
         correct += is_correct
     print('Passed : {}/{}'.format(correct, len(inputs)))
     return correct / float(len(inputs))
+
 
 if __name__ == '__main__':
     run(train)
