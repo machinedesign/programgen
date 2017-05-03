@@ -56,40 +56,44 @@ class Simple(nn.Module):
         om_val = om_val.view(om_val.size(0), self.mem_len, self.mem_size).view(-1, self.mem_size)
         return om_val, ot
     
-    def generate(self, X, mem_len=13, text_len=20, cuda=False, greedy=False):
+    def generate(self, X, mem_len=13, text_len=20, cuda=False, greedy=False, beam_size=1):
         X = self.repr_features(X)
         m = self.pred_mem_val(X)
         m = self.mem_repr(m)
         m = m.mean(0).view(1, 1, -1)
 
-        T = torch.ones(1, 1).long()
+        T = torch.ones(beam_size, 1, 1).long()
         T = Variable(T)
         if cuda:
             T = T.cuda()
-        ht, ct = torch.zeros(1, 1, self.hidden_size), torch.zeros(1, 1, self.hidden_size)
+        ht, ct = torch.zeros(beam_size, 1, 1, self.hidden_size), torch.zeros(beam_size, 1, 1, self.hidden_size)
         ht = Variable(ht)
         ct = Variable(ct)
         if cuda:
             ht = ht.cuda()
             ct = ct.cuda()
-        t = []
-        for _ in range(text_len):
-            T_emb = self.emb(T.detach())
-            x = torch.cat((T_emb, m), 2)
-            ot, (ht, ct) = self.text_rnn(x, (ht, ct))
-            ot = ot.view(-1, self.hidden_size)
-            ot = nn.Softmax()(self.text_out(ot))
-            ot = ot.view(-1)
-            if greedy:
-                ot = ot.max(0)[1]
-            else:
-                ot = torch.multinomial(ot)
-            T.data[:, :] = ot.data[0]
-            t.append(ot.data[0])
-            if ot.data[0] == 2:
-                break
+        t = [[] for b in range(beam_size)]
+        for i in range(text_len):
+            for b in range(beam_size):
+                if 2 in t[b]:
+                    break
+                T_emb = self.emb(T[b].detach())
+                x = torch.cat((T_emb, m), 2)
+                ot, (ht[b], ct[b]) = self.text_rnn(x, (ht[b], ct[b]))
+                ot = ot.view(-1, self.hidden_size)
+                ot = nn.Softmax()(self.text_out(ot))
+                ot = ot.view(-1)
+                if greedy:
+                    if i == 3: #when to start beam search
+                        _, ind = ot.topk(beam_size, dim=0)
+                        ot = ind[b]
+                    else:
+                        ot = ot.max(0)[1]
+                else:
+                    ot = torch.multinomial(ot)
+                T.data[b, :, :] = ot.data[0]
+                t[b].append(ot.data[0])
         return t
-   
 
 
 class RNN(nn.Module):
@@ -294,7 +298,7 @@ class RNN(nn.Module):
             if ot.data[0] == 2:
                 break
         return t
-   
+
     def trepr(self, ot, mt):
         return torch.cat((mt, mt), 2)
 
@@ -495,10 +499,11 @@ def train(*, nb_epochs=100, nb_programs=10, nb_examples=64,
             if nb_updates % 100 == 0:
                 max_score = 0.
                 best = None
-                for _ in range(nb_trials):
-                    t = rnn.generate(X, mem_len=mem_len, text_len=max_code_size, cuda=cuda, greedy=False)
-                    t, = doc.inverse_transform([t])
+                codes = rnn.generate(X, mem_len=mem_len, text_len=max_code_size, cuda=cuda, greedy=True, beam_size=nb_trials)
+                codes = doc.inverse_transform(codes)
+                for t in codes:
                     score = unit_test(t, inputs=inps, outputs=outs, exec_code=exec_code, print=log.debug)
+                    print(t, score)
                     if score > max_score or best is None:
                         max_score = score
                         best = t
@@ -544,9 +549,10 @@ def train(*, nb_epochs=100, nb_programs=10, nb_examples=64,
                     X = X.cuda()
                 max_score = 0.
                 best = None
-                for _ in range(nb_trials):
-                    t = rnn.generate(X, mem_len=mem_len, text_len=max_code_size, cuda=cuda, greedy=False)
-                    t, = doc.inverse_transform([t])
+
+                codes = rnn.generate(X, mem_len=mem_len, text_len=max_code_size, cuda=cuda, greedy=True, beam_size=nb_trials)
+                codes = doc.inverse_transform(codes)
+                for t in codes:
                     log_test.debug('Groundtruth : {}'.format(to_str(code)))
                     score = unit_test(t, inputs=inps, outputs=outs, exec_code=exec_code, print=log_test.debug)
                     if score > max_score or best is None:
